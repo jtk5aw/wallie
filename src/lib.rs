@@ -1,5 +1,6 @@
 use std::{
     io::ErrorKind,
+    ops::Range,
     path::PathBuf,
     sync::atomic::{AtomicU64, AtomicUsize},
 };
@@ -8,18 +9,6 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf},
 };
 
-/// Potential Wishlist:
-/// 1. Way to seek through the log somehow at an an arbitrary "index". Right now theres no concept
-///    of an index but it might be useful when passing entries to a follower to go back to an
-///    arbitrary index
-/// 2. (Probably better than 1) Ability to seek backwards through the log somehow. When a follower
-///    is behind it will need past committed entries and to do that you have to go backwards
-///    through the log.
-///    What this requires though is some fixed width to go back to the previous entry. The way I'm
-///    currently allowing any width of an entry to exist makes this impossible.
-///    But, if I make the fixed width u32 size that's insanely large and if I make it u16 it seems
-///    pretty tiny. So the best option seems to be making it u16 sized and letting multiple records
-///    make up one entry.
 /// Plans:
 /// This is inteded to be a WAL used by a distributed consensus algorithm (Raft, Viewstamped
 /// repcliation, Paxos). I say that having only ever used Raft but I believe the needs of a WAL (or
@@ -62,12 +51,13 @@ pub enum WALError {
     WriteAllFailure(io::Error),
     FlushFailure(io::Error),
     ReadExactFailure(io::Error),
+    ConvertRecordFailure(String),
 }
 
 const BLOCK_SIZE: usize = 32_000;
 const MAX_TOTAL_RECORD_SIZE: usize = 128_000;
 // The subtraced values come from the pieces of the WAL Record format
-const MAX_WAL_RECORD_SIZE: u16 = (BLOCK_SIZE as u16) - 4 - 2 - 1;
+const MAX_WAL_RECORD_SIZE: usize = BLOCK_SIZE - 4 - 2 - 1;
 
 pub struct WAL {
     /// Path to the WAL file
@@ -96,7 +86,6 @@ pub struct WALBlock {
     len: Option<usize>,
 }
 
-
 /// WAL Record Format
 /// +---------+-----------+-----------+--- ... ---+
 /// |CRC (4B) | Size (2B) | Type (1B) | Payload   |
@@ -110,35 +99,60 @@ pub struct WALBlock {
 struct WALRecord {
     crc: [u8; 4],
     size: u16,
-    record_type: u8,
+    record_type: RecordType,
     payload: Box<[u8]>,
 }
 
+#[derive(Clone)]
 enum RecordType {
-    Full = 1,
-    Start = 2,
-    Middle = 3,
-    End = 4,
+    Full,
+    Start,
+    Middle,
+    End,
 }
 
 pub struct Record {
-    size: u16,
-    payload: Box<[u8]>
+    /// Size of the record
+    /// Warning: Must be limited to MAX_TOTAL_RECORD_SIZE. Exceeding that could lead to panics
+    size: usize,
+    /// Payload as bytes that will be written
+    payload: Box<[u8]>,
+}
+
+impl RecordType {
+    fn as_byte(&self) -> u8 {
+        match self {
+            Self::Full => b'1',
+            Self::Start => b'2',
+            Self::Middle => b'3',
+            Self::End => b'4',
+        }
+    }
+}
+
+impl WALRecord {
+    fn new(payload: &[u8], size: u16, record_type: RecordType) -> WALRecord {
+        WALRecord {
+            crc: *calc_crc(payload),
+            size,
+            record_type,
+            payload: Box::from(payload),
+        }
+    }
 }
 
 impl Record {
     fn new(bytes: Box<[u8]>) -> Result<Record, String> {
         let len = bytes.as_ref().len();
         if len > MAX_TOTAL_RECORD_SIZE {
-           return Err(format!(
-                   "provided payload ({:?}) larger than maximum record size {:?}", 
-                   len, 
-                   MAX_TOTAL_RECORD_SIZE
+            return Err(format!(
+                "provided payload ({:?}) larger than maximum record size {:?}",
+                len, MAX_TOTAL_RECORD_SIZE
             ));
         }
         Ok(Record {
-            size: len as u16, 
-            payload: bytes
+            size: len,
+            payload: bytes,
         })
     }
 }
@@ -147,32 +161,104 @@ enum ConvertedRecord {
     Single([WALRecord; 1]),
     Double([WALRecord; 2]),
     Triple([WALRecord; 3]),
-    Quadruple([WALRecord; 4])
+    Quadruple([WALRecord; 4]),
 }
 
+/// Converts a single Record into up to four WALRecords depending on the provided size
+impl TryFrom<Record> for ConvertedRecord {
+    type Error = WALError;
 
-/// TODO TODO TODO: I want to write from Record to ConvertedRecord but it will require calling
-/// async functions. Is there a way to accomplish this or will I just have to make my own trait?  
-
-/// Converts a single Record into up to three WALRecords depending on the provided size
-impl From<Record> for ConvertedRecord {
-    fn from(value: Record) -> Self {
-        if value.size < MAX_WAL_RECORD_SIZE {
-            let single_record = WALRecord {
-                crc: calc_crc(&value.payload).await,
-                size: value.size,
-                record_type: RecordType::Full,
-                payload: value.payload,
-            };
+    fn try_from(value: Record) -> Result<Self, Self::Error> {
+        let result = if (value.size as usize) < MAX_WAL_RECORD_SIZE {
+            let single_record = WALRecord::new(
+                &value.payload,
+                value.size.try_into().map_err(|_| {
+                    WALError::PayloadTooLarge("value too large to create WALRecord".to_string())
+                })?,
+                RecordType::Full,
+            );
             ConvertedRecord::Single([single_record])
         } else if value.size < 2 * MAX_WAL_RECORD_SIZE {
-            ConvertedRecord::Double([WALRecord {}, WALRecord {}])
+            let payload_ref = value.payload.as_ref();
+
+            let ranges_and_types = vec![
+                ((0..MAX_WAL_RECORD_SIZE as usize), RecordType::Start),
+                (
+                    (MAX_WAL_RECORD_SIZE as usize..value.size as usize),
+                    RecordType::End,
+                ),
+            ];
+            let wal_records = create_wal_records(payload_ref, ranges_and_types)?;
+
+            ConvertedRecord::Double(wal_records.try_into().map_err(|_| {
+                WALError::ConvertRecordFailure("failed to convert record to WALRecord".to_string())
+            })?)
         } else if value.size < 3 * MAX_WAL_RECORD_SIZE {
-            ConvertedRecord::Triple([WALRecord {}, WALRecord {}, WALRecord {}])
+            let payload_ref = value.payload.as_ref();
+
+            let ranges_and_types = vec![
+                ((0..MAX_WAL_RECORD_SIZE as usize), RecordType::Start),
+                (
+                    (MAX_WAL_RECORD_SIZE as usize..(2 * MAX_WAL_RECORD_SIZE) as usize),
+                    RecordType::Middle,
+                ),
+                (
+                    ((2 * MAX_WAL_RECORD_SIZE) as usize..value.size as usize),
+                    RecordType::End,
+                ),
+            ];
+            let wal_records = create_wal_records(payload_ref, ranges_and_types)?;
+
+            ConvertedRecord::Triple(wal_records.try_into().map_err(|_| {
+                WALError::ConvertRecordFailure("failed to convert record to WALRecord".to_string())
+            })?)
         } else {
-            ConvertedRecord::Quadruple([WALRecord {}, WALRecord {}, WALRecord {}, WALRecord {}])
-        }
+            let payload_ref = value.payload.as_ref();
+            let ranges_and_types = vec![
+                ((0..MAX_WAL_RECORD_SIZE as usize), RecordType::Start),
+                (
+                    (MAX_WAL_RECORD_SIZE as usize..(2 * MAX_WAL_RECORD_SIZE) as usize),
+                    RecordType::Middle,
+                ),
+                (
+                    ((2 * MAX_WAL_RECORD_SIZE) as usize..(3 * MAX_WAL_RECORD_SIZE) as usize),
+                    RecordType::End,
+                ),
+                (
+                    ((3 * MAX_WAL_RECORD_SIZE) as usize..value.size as usize),
+                    RecordType::End,
+                ),
+            ];
+            let wal_records = create_wal_records(payload_ref, ranges_and_types)?;
+
+            ConvertedRecord::Quadruple(wal_records.try_into().map_err(|_| {
+                WALError::ConvertRecordFailure("failed to convert record to WALRecord".to_string())
+            })?)
+        };
+
+        Ok(result)
     }
+}
+
+fn create_wal_records(
+    full_payload: &[u8],
+    ranges_and_types: Vec<(Range<usize>, RecordType)>,
+) -> Result<Vec<WALRecord>, WALError> {
+    let result = ranges_and_types
+        .into_iter()
+        .map(|(range, record_type)| {
+            let payload_ref = &full_payload[range];
+            Ok(WALRecord::new(
+                &payload_ref,
+                payload_ref.len().try_into().map_err(|_| {
+                    WALError::PayloadTooLarge("divided payload is too large".to_string())
+                })?,
+                record_type,
+            ))
+        })
+        .collect::<Result<Vec<WALRecord>, WALError>>()?;
+
+    Ok(result)
 }
 
 // TODO TODO TODO: Pretty much all the read and write stuff needs to be rewritten to handle the new
@@ -217,17 +303,13 @@ impl WAL {
         }
     }
 
-    pub async write(&mut self, payload: &[u8]) -> Result<(), WALError> {
-
-    }
-
     /// Cancellation Safety: Right now this function is not cancellation safe because
     /// any call to `write_all` is not cancellation safe. TODO: I THINK what this means is that
     /// if any higher level function that eventually calls this function is cancelled before
     /// completion the WAL could be corrupted by a partial write. I don't have a good answer for
     /// how to fix that right now so I'm leaving this comment
     pub async fn write_REMOVE_THIS_FUNC(&mut self, payload: &[u8]) -> Result<(), WALError> {
-        let crc_bytes: &[u8; 4] = calc_crc(payload).await;
+        let crc_bytes: &[u8; 4] = calc_crc(payload);
         let size = payload.len();
         let size_bytes: &[u8; 4] = &TryInto::<u32>::try_into(size)
             .map_err(|_| WALError::PayloadTooLarge(format!("payload too large: {:?}", size)))?
@@ -288,7 +370,7 @@ impl WAL {
     }
 }
 
-async fn calc_crc(_payload: &[u8]) -> &[u8; 4] {
+fn calc_crc(_payload: &[u8]) -> &[u8; 4] {
     return &[0, 0, 0, 0];
 }
 

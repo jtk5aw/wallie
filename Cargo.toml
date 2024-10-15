@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.0", features = ["sync", "io-util"] }
+tokio = { version = "1.0", features = ["fs", "io-util"] }
